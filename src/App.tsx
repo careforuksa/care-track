@@ -40,6 +40,7 @@ type Company = {
   last_payment_date: string | null;
   next_payment_date: string | null;
   patient_count?: number;
+  amountDue?: number;
 };
 
 type Package = {
@@ -79,7 +80,11 @@ type Visit = {
   service_name: string;
   visit_date: string;
   amount: number;
+  paid_amount: number;
   is_paid: number;
+  is_postponed?: number;
+  total_sessions?: number;
+  used_sessions?: number;
   notes: string;
 };
 
@@ -124,6 +129,7 @@ export default function App() {
   const [editingVisit, setEditingVisit] = useState<Visit | null>(null);
   const [selectedPackage, setSelectedPackage] = useState<Package | null>(null);
   const [selectedCompanyForReport, setSelectedCompanyForReport] = useState<Company | null>(null);
+  const [selectedPatientForFile, setSelectedPatientForFile] = useState<Patient | null>(null);
   
   // Visits Filters
   const [visitSearch, setVisitSearch] = useState('');
@@ -140,32 +146,30 @@ export default function App() {
   }, [activeTab, startDate, endDate]);
 
   useEffect(() => {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    
-    const due = companies.filter(company => {
-      // If user specified a next payment date, use it
-      if (company.next_payment_date) {
-        const nextDate = new Date(company.next_payment_date);
-        nextDate.setHours(0, 0, 0, 0);
-        return today >= nextDate;
-      }
+    const fetchAlerts = async () => {
+      try {
+        const res = await fetch('/api/visits');
+        const allVisits: Visit[] = await res.json();
+        
+        // Find companies with unpaid visits
+        const unpaidByCompany = allVisits.reduce((acc, v) => {
+          if (!v.is_paid && v.company_name) {
+            acc[v.company_name] = (acc[v.company_name] || 0) + (v.amount - (v.paid_amount || 0));
+          }
+          return acc;
+        }, {} as Record<string, number>);
 
-      // Fallback to period logic
-      if (!company.last_payment_date) return true;
-      const lastPaid = new Date(company.last_payment_date);
-      const diffTime = Math.abs(today.getTime() - lastPaid.getTime());
-      const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-      
-      if (company.payment_period === 'weekly') {
-        return diffDays >= 7;
-      } else if (company.payment_period === 'monthly') {
-        return diffDays >= 30;
+        const due = companies
+          .filter(c => unpaidByCompany[c.name] > 0)
+          .map(c => ({ ...c, amountDue: unpaidByCompany[c.name] }));
+        setDueCompanies(due);
+      } catch (error) {
+        console.error("Error fetching alerts:", error);
       }
-      return false;
-    });
-    setDueCompanies(due);
-  }, [companies]);
+    };
+    
+    if (companies.length > 0) fetchAlerts();
+  }, [companies, visits]);
 
   const fetchCompanyStats = async () => {
     try {
@@ -198,31 +202,77 @@ export default function App() {
     }
   };
 
-  const handleTogglePaid = async (visitId: number, currentStatus: number) => {
+  const handleTogglePaid = async (visitId: number, currentStatus: number, amount?: number) => {
     try {
-      await fetch(`/api/visits/${visitId}/pay`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ is_paid: !currentStatus })
-      });
+      const visit = visits.find(v => v.id === visitId);
+      if (!visit) return;
+
+      if (amount !== undefined) {
+        // Partial payment
+        await fetch(`/api/visits/${visitId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...visit,
+            paid_amount: (visit.paid_amount || 0) + amount,
+            is_paid: (visit.paid_amount || 0) + amount >= visit.amount ? 1 : 0
+          })
+        });
+      } else {
+        // Toggle full payment
+        await fetch(`/api/visits/${visitId}/pay`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ is_paid: !currentStatus })
+        });
+      }
       fetchData();
     } catch (error) {
       console.error("Error updating payment status:", error);
     }
   };
 
-  const handleMarkCompanyPaid = async (company: Company) => {
+  const handlePostponeVisit = async (visitId: number) => {
     try {
-      const today = new Date().toISOString().split('T')[0];
-      await fetch(`/api/companies/${company.id}`, {
+      const visit = visits.find(v => v.id === visitId);
+      if (!visit) return;
+      await fetch(`/api/visits/${visitId}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...company,
-          last_payment_date: today
-        })
+        body: JSON.stringify({ ...visit, is_postponed: 1 })
       });
       fetchData();
+      alert(t.paymentPostponed);
+    } catch (error) {
+      console.error("Error postponing visit:", error);
+    }
+  };
+
+  const handleMarkCompanyPaid = async (company: Company, amount?: number) => {
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      if (amount !== undefined) {
+        await fetch(`/api/companies/${company.id}/payments`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            amount,
+            date: today
+          })
+        });
+      } else {
+        // Fallback for full payment if amount not provided
+        await fetch(`/api/companies/${company.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...company,
+            last_payment_date: today
+          })
+        });
+      }
+      fetchData();
+      setSelectedCompanyForReport(null);
     } catch (error) {
       console.error("Error marking company as paid:", error);
     }
@@ -267,6 +317,19 @@ export default function App() {
       </div>
 
       <div className="flex">
+        {/* Mobile Backdrop */}
+        <AnimatePresence>
+          {isSidebarOpen && (
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsSidebarOpen(false)}
+              className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-30 lg:hidden"
+            />
+          )}
+        </AnimatePresence>
+
         {/* Sidebar */}
         <aside className={`
           fixed lg:sticky top-0 h-screen bg-white border-l border-slate-200 transition-all duration-300 z-40
@@ -371,12 +434,26 @@ export default function App() {
                   icon={Users} 
                   color="blue" 
                 />
-                <StatCard 
-                  label={t.pendingAmount} 
-                  value={`${stats.pending_amount?.toLocaleString() || 0} ${t.sar}`} 
-                  icon={DollarSign} 
-                  color="amber" 
-                />
+                <div className="space-y-1">
+                  <StatCard 
+                    label={t.pendingAmount} 
+                    value={`${stats.pending_amount?.toLocaleString() || 0} ${t.sar}`} 
+                    icon={DollarSign} 
+                    color="amber" 
+                  />
+                  {(stats as any).company_pending > 0 && (
+                    <div className="flex justify-between px-4 text-[10px] font-bold">
+                      <span className="text-slate-400">{t.companyDues}:</span>
+                      <span className="text-amber-600">{(stats as any).company_pending?.toLocaleString()} {t.sar}</span>
+                    </div>
+                  )}
+                  {(stats as any).direct_pending > 0 && (
+                    <div className="flex justify-between px-4 text-[10px] font-bold">
+                      <span className="text-slate-400">{t.individualDues}:</span>
+                      <span className="text-blue-600">{(stats as any).direct_pending?.toLocaleString()} {t.sar}</span>
+                    </div>
+                  )}
+                </div>
                 <StatCard 
                   label={t.collectedAmount} 
                   value={`${stats.paid_amount?.toLocaleString() || 0} ${t.sar}`} 
@@ -452,6 +529,37 @@ export default function App() {
             <Building2 size={14} />
             <span>{patient.company_name || t.direct}</span>
           </div>
+          
+          <div className="grid grid-cols-2 gap-2 mb-4">
+            <button 
+              onClick={() => {
+                setEditingVisit({
+                  id: 0,
+                  patient_id: patient.id,
+                  patient_name: patient.name,
+                  service_id: 0,
+                  service_name: '',
+                  visit_date: new Date().toISOString().split('T')[0],
+                  amount: 0,
+                  paid_amount: 0,
+                  is_paid: 0,
+                  notes: ''
+                });
+              }}
+              className="bg-emerald-50 text-emerald-700 font-bold py-2 rounded-xl hover:bg-emerald-100 transition-colors text-xs flex items-center justify-center gap-1"
+            >
+              <Plus size={14} />
+              {t.newVisit}
+            </button>
+            <button 
+              onClick={() => setSelectedPatientForFile(patient)}
+              className="bg-slate-50 text-slate-600 font-bold py-2 rounded-xl hover:bg-slate-100 transition-colors text-xs flex items-center justify-center gap-1"
+            >
+              <FileText size={14} />
+              {t.medicalFile}
+            </button>
+          </div>
+
           <div className="pt-4 border-t border-slate-50 flex justify-between items-center text-xs text-slate-400">
             <span>{t.joinedIn}: {new Date(patient.created_at).toLocaleDateString(lang === 'ar' ? 'ar-SA' : 'en-US')}</span>
             <button 
@@ -459,6 +567,21 @@ export default function App() {
               className="text-emerald-600 font-bold hover:underline"
             >
               {t.edit}
+            </button>
+            <button 
+              onClick={async () => {
+                if (confirm(t.confirmDeletePatient)) {
+                  const res = await fetch(`/api/patients/${patient.id}`, { method: 'DELETE' });
+                  if (res.ok) fetchData();
+                  else {
+                    const err = await res.json();
+                    alert(`${t.error}: ${err.error}`);
+                  }
+                }
+              }}
+              className="text-rose-500 font-bold hover:underline"
+            >
+              {t.delete}
             </button>
           </div>
                 </motion.div>
@@ -618,16 +741,19 @@ export default function App() {
                 </AnimatePresence>
 
                 <div className="overflow-x-auto">
-                  <table className="w-full text-right">
+                  <table className={`w-full ${lang === 'ar' ? 'text-right' : 'text-left'}`}>
                     <thead className="bg-slate-50 text-slate-500 text-sm uppercase tracking-wider">
                       <tr>
-                        <th className="px-6 py-4 font-semibold">المريض</th>
-                        <th className="px-6 py-4 font-semibold">الخدمة</th>
-                        <th className="px-6 py-4 font-semibold">الشركة</th>
-                        <th className="px-6 py-4 font-semibold">التاريخ</th>
-                        <th className="px-6 py-4 font-semibold">المبلغ</th>
-                        <th className="px-6 py-4 font-semibold">الحالة</th>
-                        <th className="px-6 py-4 font-semibold">إجراء</th>
+                        <th className="px-6 py-4 font-semibold">{t.patient}</th>
+                        <th className="px-6 py-4 font-semibold">{t.service}</th>
+                        <th className="px-6 py-4 font-semibold">{t.company}</th>
+                        <th className="px-6 py-4 font-semibold">{t.sessions}</th>
+                        <th className="px-6 py-4 font-semibold">{t.date}</th>
+                        <th className="px-6 py-4 font-semibold">{t.amount}</th>
+                        <th className="px-6 py-4 font-semibold">{t.amountPaid}</th>
+                        <th className="px-6 py-4 font-semibold">{t.balance}</th>
+                        <th className="px-6 py-4 font-semibold">{t.status}</th>
+                        <th className="px-6 py-4 font-semibold">{t.actions}</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
@@ -647,43 +773,91 @@ export default function App() {
                         const matchesService = visitServiceFilter === 'all' || v.service_id?.toString() === visitServiceFilter;
                         
                         return matchesSearch && matchesCompany && matchesStatus && matchesService && matchesStart && matchesEnd;
-                      }).map((visit) => (
-                      <tr key={visit.id} className="hover:bg-slate-50 transition-colors">
-                        <td className="px-6 py-4 font-medium">{visit.patient_name}</td>
-                        <td className="px-6 py-4 text-emerald-600 font-medium">{visit.service_name}</td>
-                        <td className="px-6 py-4 text-slate-600">{visit.company_name || 'مباشر'}</td>
-                        <td className="px-6 py-4 text-slate-500 text-sm">{new Date(visit.visit_date).toLocaleDateString('ar-SA')}</td>
-                        <td className="px-6 py-4 font-mono font-semibold">{visit.amount} ر.س</td>
-                        <td className="px-6 py-4 text-slate-400 text-sm max-w-xs truncate">{visit.notes || '-'}</td>
-                        <td className="px-6 py-4">
-                          <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold ${
-                            visit.is_paid ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'
-                          }`}>
-                            {visit.is_paid ? <CheckCircle2 size={12} /> : <XCircle size={12} />}
-                            {visit.is_paid ? 'تم الدفع' : 'معلق'}
-                          </span>
-                        </td>
-                        <td className="px-6 py-4">
-                          <div className="flex items-center gap-2">
-                            <button 
-                              onClick={() => handleTogglePaid(visit.id, visit.is_paid)}
-                              className={`text-xs font-bold px-3 py-1 rounded-lg transition-colors ${
-                                visit.is_paid ? 'text-slate-400 hover:text-amber-600' : 'text-emerald-600 hover:bg-emerald-50'
-                              }`}
-                            >
-                              {visit.is_paid ? 'تراجع' : 'تأكيد'}
-                            </button>
-                            <button 
-                              onClick={() => setEditingVisit(visit)}
-                              className="text-xs font-bold text-slate-400 hover:text-emerald-600"
-                            >
-                              تعديل
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
+                      }).map((visit) => {
+                        const balance = visit.amount - (visit.paid_amount || 0);
+                        const isPartial = visit.paid_amount > 0 && visit.paid_amount < visit.amount;
+                        const isPostponed = (visit as any).is_postponed === 1;
+                        
+                        return (
+                          <tr key={visit.id} className="hover:bg-slate-50 transition-colors">
+                            <td className="px-6 py-4 font-medium">{visit.patient_name}</td>
+                            <td className="px-6 py-4 text-emerald-600 font-medium">{visit.service_name}</td>
+                            <td className="px-6 py-4 text-slate-600">{visit.company_name || t.direct}</td>
+                            <td className="px-6 py-4">
+                              {visit.total_sessions && visit.total_sessions > 1 ? (
+                                <div className="flex flex-col gap-1">
+                                  <div className="flex justify-between text-[10px] font-bold">
+                                    <span className="text-emerald-600">{visit.used_sessions || 0}</span>
+                                    <span className="text-slate-400">/ {visit.total_sessions}</span>
+                                  </div>
+                                  <div className="w-16 bg-slate-100 h-1.5 rounded-full overflow-hidden">
+                                    <div 
+                                      className="bg-emerald-500 h-full transition-all"
+                                      style={{ width: `${((visit.used_sessions || 0) / visit.total_sessions) * 100}%` }}
+                                    />
+                                  </div>
+                                </div>
+                              ) : (
+                                <span className="text-slate-400">-</span>
+                              )}
+                            </td>
+                            <td className="px-6 py-4 text-slate-500 text-sm">{new Date(visit.visit_date).toLocaleDateString(lang === 'ar' ? 'ar-SA' : 'en-US')}</td>
+                            <td className="px-6 py-4 font-mono font-semibold">{visit.amount} {t.sar}</td>
+                            <td className="px-6 py-4 font-mono font-semibold text-emerald-600">{visit.paid_amount || 0} {t.sar}</td>
+                            <td className="px-6 py-4 font-mono font-semibold text-rose-600">{balance} {t.sar}</td>
+                            <td className="px-6 py-4">
+                              <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-bold ${
+                                visit.is_paid ? 'bg-emerald-100 text-emerald-700' : 
+                                isPostponed ? 'bg-amber-100 text-amber-700' :
+                                isPartial ? 'bg-blue-100 text-blue-700' : 'bg-slate-100 text-slate-700'
+                              }`}>
+                                {visit.is_paid ? <CheckCircle2 size={12} /> : isPostponed ? <Clock size={12} /> : isPartial ? <Clock size={12} /> : <XCircle size={12} />}
+                                {visit.is_paid ? t.paid : isPostponed ? t.paymentPostponed : isPartial ? t.partialPayment : t.pending}
+                              </span>
+                            </td>
+                            <td className="px-6 py-4">
+                              <div className="flex items-center gap-2">
+                                {!visit.is_paid && (
+                                  <>
+                                    <button 
+                                      onClick={() => {
+                                        const amount = prompt(t.enterAmount);
+                                        if (amount) handleTogglePaid(visit.id, visit.is_paid, parseFloat(amount));
+                                      }}
+                                      className="text-[10px] font-bold px-2 py-1 bg-emerald-50 text-emerald-600 rounded-lg hover:bg-emerald-100 transition-colors"
+                                    >
+                                      {t.partial}
+                                    </button>
+                                    {!isPostponed && (
+                                      <button 
+                                        onClick={() => handlePostponeVisit(visit.id)}
+                                        className="text-[10px] font-bold px-2 py-1 bg-amber-50 text-amber-600 rounded-lg hover:bg-amber-100 transition-colors"
+                                      >
+                                        {t.postpone}
+                                      </button>
+                                    )}
+                                  </>
+                                )}
+                                <button 
+                                  onClick={() => handleTogglePaid(visit.id, visit.is_paid)}
+                                  className={`text-xs font-bold px-3 py-1 rounded-lg transition-colors ${
+                                    visit.is_paid ? 'text-slate-400 hover:text-amber-600' : 'text-emerald-600 hover:bg-emerald-50'
+                                  }`}
+                                >
+                                  {visit.is_paid ? t.undo : t.confirm}
+                                </button>
+                                <button 
+                                  onClick={() => setEditingVisit(visit)}
+                                  className="text-xs font-bold text-slate-400 hover:text-emerald-600"
+                                >
+                                  {t.edit}
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
                 </table>
               </div>
             </div>
@@ -721,7 +895,7 @@ export default function App() {
                         onClick={() => setEditingCompany(company)}
                         className="absolute left-4 top-4 p-2 text-slate-400 hover:text-emerald-600 opacity-0 group-hover:opacity-100 transition-opacity"
                       >
-                        تعديل
+                        {t.edit}
                       </button>
                       <div className="w-12 h-12 bg-emerald-50 rounded-2xl flex items-center justify-center text-emerald-600 mb-4">
                         <Building2 size={24} />
@@ -729,16 +903,16 @@ export default function App() {
                       <h4 className="text-lg font-bold mb-1">{company.name}</h4>
                       <div className="space-y-2 mt-4">
                         <div className="flex items-center justify-between text-sm">
-                          <span className="text-slate-500">عدد المرضى:</span>
+                          <span className="text-slate-500">{lang === 'ar' ? 'عدد المرضى:' : 'Patient Count:'}</span>
                           <span className="font-bold text-emerald-600">{stats?.patient_count || 0}</span>
                         </div>
                         <div className="flex items-center justify-between text-sm">
-                          <span className="text-slate-500">عدد الزيارات:</span>
+                          <span className="text-slate-500">{lang === 'ar' ? 'عدد الزيارات:' : 'Visit Count:'}</span>
                           <span className="font-bold">{stats?.visit_count || 0}</span>
                         </div>
                         <div className="flex items-center justify-between text-sm border-t border-slate-50 pt-2">
-                          <span className="text-slate-500">إجمالي المبالغ:</span>
-                          <span className="font-bold">{stats?.total_amount || 0} ر.س</span>
+                          <span className="text-slate-500">{lang === 'ar' ? 'إجمالي المبالغ:' : 'Total Amount:'}</span>
+                          <span className="font-bold">{stats?.total_amount || 0} {t.sar}</span>
                         </div>
                       </div>
 
@@ -749,34 +923,54 @@ export default function App() {
                             onClick={() => setSelectedCompanyForReport(company)}
                             className="flex-1 bg-emerald-50 text-emerald-700 font-bold py-2 rounded-xl hover:bg-emerald-100 transition-colors text-sm"
                           >
-                            عرض التقرير
+                            {t.viewFullDetails}
                           </button>
                           <button 
                             onClick={() => setEditingCompany(company)}
                             className="px-4 bg-slate-50 text-slate-600 font-bold py-2 rounded-xl hover:bg-slate-100 transition-colors text-sm"
                           >
-                            تعديل
+                            {t.edit}
+                          </button>
+                          <button 
+                            onClick={async () => {
+                              if (confirm(t.confirmDeleteCompany)) {
+                                const res = await fetch(`/api/companies/${company.id}`, { method: 'DELETE' });
+                                if (res.ok) fetchData();
+                                else {
+                                  const err = await res.json();
+                                  alert(`${t.error}: ${err.error}`);
+                                }
+                              }
+                            }}
+                            className="px-4 bg-rose-50 text-rose-600 font-bold py-2 rounded-xl hover:bg-rose-100 transition-colors text-sm"
+                          >
+                            {t.delete}
                           </button>
                         </div>
                         
                         <h5 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-2">
                           <Users size={14} />
-                          قائمة المرضى
+                          {t.patients}
                         </h5>
                         <div className="space-y-2 max-h-40 overflow-y-auto pr-1 custom-scrollbar">
                           {patients.filter(p => p.company_id === company.id).length > 0 ? (
                             patients.filter(p => p.company_id === company.id).map(patient => (
                               <div key={patient.id} className="flex items-center justify-between p-2 bg-slate-50 rounded-lg text-sm">
-                                <span className="font-medium text-slate-700">{patient.name}</span>
+                                <button 
+                                  onClick={() => setSelectedPatientForFile(patient)}
+                                  className="font-medium text-slate-700 hover:text-emerald-600 transition-colors text-right"
+                                >
+                                  {patient.name}
+                                </button>
                                 <span className={`text-[10px] px-2 py-0.5 rounded-full ${
                                   patient.status === 'active' ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-200 text-slate-600'
                                 }`}>
-                                  {patient.status === 'active' ? 'نشط' : 'غير نشط'}
+                                  {patient.status === 'active' ? t.active : t.inactive}
                                 </span>
                               </div>
                             ))
                           ) : (
-                            <p className="text-xs text-slate-400 italic text-center py-2">لا يوجد مرضى مضافين</p>
+                            <p className="text-xs text-slate-400 italic text-center py-2">{t.noPatientsAdded}</p>
                           )}
                         </div>
                       </div>
@@ -793,6 +987,7 @@ export default function App() {
               setStartDate={setStartDate} 
               setEndDate={setEndDate} 
               companies={companies}
+              services={services}
               lang={lang}
             />
           )}
@@ -858,15 +1053,15 @@ export default function App() {
             <div className="space-y-6">
               <div className="flex items-center justify-between">
                 <div>
-                  <h3 className="text-2xl font-bold text-slate-800">برامج العلاج (الجلسات)</h3>
-                  <p className="text-slate-500">تتبع عدد الجلسات المتبقية لكل مريض</p>
+                  <h3 className="text-2xl font-bold text-slate-800">{t.packages}</h3>
+                  <p className="text-slate-500">{t.treatmentPackagesDesc}</p>
                 </div>
                 <button 
                   onClick={() => setShowAddPackage(true)}
                   className="bg-emerald-600 text-white px-6 py-3 rounded-2xl font-bold flex items-center gap-2 hover:bg-emerald-700 transition-all shadow-lg shadow-emerald-100"
                 >
                   <Plus size={20} />
-                  برنامج جديد
+                  {t.newPackage}
                 </button>
               </div>
 
@@ -887,7 +1082,7 @@ export default function App() {
                       <span className={`text-[10px] font-bold px-2 py-1 rounded-full ${
                         pkg.used_sessions >= pkg.total_sessions ? 'bg-rose-100 text-rose-700' : 'bg-emerald-100 text-emerald-700'
                       }`}>
-                        {pkg.used_sessions >= pkg.total_sessions ? 'مكتمل' : 'نشط'}
+                        {pkg.used_sessions >= pkg.total_sessions ? t.completed : t.active}
                       </span>
                     </div>
                     <h4 className="text-lg font-bold mb-1">{pkg.patient_name}</h4>
@@ -915,7 +1110,7 @@ export default function App() {
 
               {packages.length === 0 && (
                 <div className="bg-white p-12 rounded-3xl border border-slate-200 text-center">
-                  <p className="text-slate-400 italic">لا توجد برامج علاجية مسجلة حالياً</p>
+                  <p className="text-slate-400 italic">{t.noPackages}</p>
                 </div>
               )}
             </div>
@@ -925,18 +1120,18 @@ export default function App() {
             <div className="space-y-6">
               <div className="flex items-center justify-between">
                 <div>
-                  <h3 className="text-2xl font-bold text-slate-800">تنبيهات الدفع المستحق</h3>
-                  <p className="text-slate-500">الشركات التي تجاوزت فترة الدفع المحددة لها</p>
+                  <h3 className="text-2xl font-bold text-slate-800">{t.alerts}</h3>
+                  <p className="text-slate-500">{t.paymentAlertsDesc}</p>
                 </div>
                 <div className="bg-amber-50 text-amber-700 px-4 py-2 rounded-2xl flex items-center gap-2 font-bold">
                   <AlertCircle size={20} />
-                  <span>{dueCompanies.length} شركات مستحقة</span>
+                  <span>{dueCompanies.length} {t.dueCompaniesCount}</span>
                 </div>
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                 {dueCompanies.map((company) => {
-                  const lastPaid = company.last_payment_date ? new Date(company.last_payment_date).toLocaleDateString('ar-SA') : 'لم يتم الدفع مسبقاً';
+                  const lastPaid = company.last_payment_date ? new Date(company.last_payment_date).toLocaleDateString(lang === 'ar' ? 'ar-SA' : 'en-US') : t.neverPaid;
                   return (
                     <motion.div 
                       initial={{ opacity: 0, y: 20 }}
@@ -953,8 +1148,8 @@ export default function App() {
                           company.payment_period === 'weekly' ? 'bg-blue-100 text-blue-700' : 
                           company.payment_period === 'monthly' ? 'bg-purple-100 text-purple-700' : 'bg-slate-100 text-slate-700'
                         }`}>
-                          {company.payment_period === 'weekly' ? (lang === 'ar' ? 'دورة أسبوعية' : 'Weekly') : 
-                           company.payment_period === 'monthly' ? (lang === 'ar' ? 'دورة شهرية' : 'Monthly') : (lang === 'ar' ? 'تاريخ مخصص' : 'Custom')}
+                          {company.payment_period === 'weekly' ? t.weeklyCycle : 
+                           company.payment_period === 'monthly' ? t.monthlyCycle : t.customCycle}
                         </span>
                       </div>
                       <h4 className="text-lg font-bold mb-1">{company.name}</h4>
@@ -963,11 +1158,15 @@ export default function App() {
                         {t.lastPayment}: {lastPaid}
                       </p>
                       {company.next_payment_date && (
-                        <p className="text-sm text-amber-600 font-bold mb-4 flex items-center gap-1">
+                        <p className="text-sm text-amber-600 font-bold mb-1 flex items-center gap-1">
                           <AlertCircle size={14} />
                           {t.dueDate}: {new Date(company.next_payment_date).toLocaleDateString(lang === 'ar' ? 'ar-SA' : 'en-US')}
                         </p>
                       )}
+                      <p className="text-sm text-emerald-600 font-bold mb-4 flex items-center gap-1">
+                        <DollarSign size={14} />
+                        {t.amountDueSoFar}: {company.amountDue?.toLocaleString()} {t.sar}
+                      </p>
                       
                       <div className="space-y-3">
                         <button 
@@ -1089,9 +1288,33 @@ export default function App() {
           >
             <CompanyReport 
               company={selectedCompanyForReport} 
-              onMarkPaid={() => {
-                handleMarkCompanyPaid(selectedCompanyForReport);
+              onMarkPaid={(amount) => {
+                handleMarkCompanyPaid(selectedCompanyForReport, amount);
                 setSelectedCompanyForReport(null);
+              }}
+              lang={lang}
+            />
+          </Modal>
+        )}
+        {selectedPatientForFile && (
+          <Modal title={lang === 'ar' ? 'الملف الطبي للمريض' : 'Patient Medical File'} onClose={() => setSelectedPatientForFile(null)}>
+            <PatientFile 
+              patient={selectedPatientForFile} 
+              services={services}
+              onAddVisit={() => {
+                setEditingVisit({
+                  id: 0,
+                  patient_id: selectedPatientForFile.id,
+                  patient_name: selectedPatientForFile.name,
+                  service_id: 0,
+                  service_name: '',
+                  visit_date: new Date().toISOString().split('T')[0],
+                  amount: 0,
+                  paid_amount: 0,
+                  is_paid: 0,
+                  notes: ''
+                });
+                setSelectedPatientForFile(null);
               }}
               lang={lang}
             />
@@ -1122,16 +1345,21 @@ function StatCard({ label, value, icon: Icon, color }: { label: string, value: a
   );
 }
 
-function CompanyReport({ company, onMarkPaid, lang }: { company: Company, onMarkPaid: () => void, lang: 'ar' | 'en' }) {
+function CompanyReport({ company, onMarkPaid, lang }: { company: Company, onMarkPaid: (amount: number) => void, lang: 'ar' | 'en' }) {
   const t = translations[lang];
   const [visits, setVisits] = useState<Visit[]>([]);
   const [loading, setLoading] = useState(true);
+  const [receivedAmount, setReceivedAmount] = useState<string>('');
 
   useEffect(() => {
     const fetchCompanyVisits = async () => {
       try {
         const res = await fetch(`/api/visits?company_id=${company.id}`);
-        setVisits(await res.json());
+        const data = await res.json();
+        setVisits(data);
+        const unpaid = data.filter((v: Visit) => !v.is_paid);
+        const total = unpaid.reduce((sum: number, v: Visit) => sum + (v.amount - (v.paid_amount || 0)), 0);
+        setReceivedAmount(total.toString());
       } catch (error) {
         console.error("Error fetching company visits:", error);
       } finally {
@@ -1142,7 +1370,7 @@ function CompanyReport({ company, onMarkPaid, lang }: { company: Company, onMark
   }, [company.id]);
 
   const unpaidVisits = visits.filter(v => !v.is_paid);
-  const totalUnpaid = unpaidVisits.reduce((sum, v) => sum + v.amount, 0);
+  const totalUnpaid = unpaidVisits.reduce((sum, v) => sum + (v.amount - (v.paid_amount || 0)), 0);
 
   if (loading) return <div className="p-8 text-center text-slate-500">{lang === 'ar' ? 'جاري تحميل التقرير...' : 'Loading report...'}</div>;
 
@@ -1165,13 +1393,14 @@ function CompanyReport({ company, onMarkPaid, lang }: { company: Company, onMark
           {t.viewDetailsInvoices} ({unpaidVisits.length})
         </h5>
         
-        <div className="max-h-80 overflow-y-auto custom-scrollbar border border-slate-100 rounded-2xl">
+        <div className="max-h-60 overflow-y-auto custom-scrollbar border border-slate-100 rounded-2xl">
           <table className={`w-full ${lang === 'ar' ? 'text-right' : 'text-left'} text-sm`}>
             <thead className="bg-slate-50 sticky top-0">
               <tr>
                 <th className="px-4 py-3 font-bold text-slate-600">{t.patient}</th>
                 <th className="px-4 py-3 font-bold text-slate-600">{t.date}</th>
                 <th className="px-4 py-3 font-bold text-slate-600">{t.amount}</th>
+                <th className="px-4 py-3 font-bold text-slate-600">{t.balance}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-50">
@@ -1180,11 +1409,12 @@ function CompanyReport({ company, onMarkPaid, lang }: { company: Company, onMark
                   <td className="px-4 py-3 font-medium">{visit.patient_name}</td>
                   <td className="px-4 py-3 text-slate-500">{new Date(visit.visit_date).toLocaleDateString(lang === 'ar' ? 'ar-SA' : 'en-US')}</td>
                   <td className="px-4 py-3 font-bold text-slate-700">{visit.amount} {t.sar}</td>
+                  <td className="px-4 py-3 font-bold text-rose-600">{(visit.amount - (visit.paid_amount || 0))} {t.sar}</td>
                 </tr>
               ))}
               {unpaidVisits.length === 0 && (
                 <tr>
-                  <td colSpan={3} className="px-4 py-8 text-center text-slate-400 italic">{t.noDuePayments}</td>
+                  <td colSpan={4} className="px-4 py-8 text-center text-slate-400 italic">{t.noDuePayments}</td>
                 </tr>
               )}
             </tbody>
@@ -1192,10 +1422,32 @@ function CompanyReport({ company, onMarkPaid, lang }: { company: Company, onMark
         </div>
       </div>
 
-      <div className="flex gap-3 pt-4 print:hidden">
+      <div className="bg-emerald-50 p-4 rounded-2xl border border-emerald-100 space-y-3">
+        <label className="block text-sm font-bold text-emerald-800">{t.receivedAmount}</label>
+        <div className="relative">
+          <input 
+            type="number"
+            value={receivedAmount}
+            onChange={(e) => setReceivedAmount(e.target.value)}
+            className="w-full px-4 py-3 bg-white border-2 border-emerald-200 rounded-xl outline-none focus:border-emerald-500 font-bold text-lg"
+            placeholder="0.00"
+          />
+          <div className={`absolute top-1/2 -translate-y-1/2 ${lang === 'ar' ? 'left-4' : 'right-4'} font-bold text-emerald-600`}>
+            {t.sar}
+          </div>
+        </div>
+        {parseFloat(receivedAmount) < totalUnpaid && (
+          <p className="text-xs text-amber-600 font-bold flex items-center gap-1">
+            <AlertCircle size={14} />
+            {t.partialPayment}: {t.remainingBalance} {(totalUnpaid - parseFloat(receivedAmount || '0')).toLocaleString()} {t.sar}
+          </p>
+        )}
+      </div>
+
+      <div className="flex gap-3 pt-2 print:hidden">
         <button 
-          onClick={onMarkPaid}
-          disabled={unpaidVisits.length === 0}
+          onClick={() => onMarkPaid(parseFloat(receivedAmount))}
+          disabled={unpaidVisits.length === 0 || !receivedAmount || parseFloat(receivedAmount) <= 0}
           className="flex-1 bg-emerald-600 text-white font-bold py-3 rounded-xl hover:bg-emerald-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 shadow-lg shadow-emerald-100"
         >
           <CheckCircle2 size={20} />
@@ -1203,7 +1455,7 @@ function CompanyReport({ company, onMarkPaid, lang }: { company: Company, onMark
         </button>
         <button 
           onClick={() => window.print()}
-          className="px-6 bg-slate-100 text-slate-600 font-bold py-3 rounded-xl hover:bg-slate-200 transition-colors flex items-center gap-2"
+          className="px-6 bg-white border border-slate-200 text-slate-600 font-bold py-3 rounded-xl hover:bg-slate-50 transition-colors flex items-center justify-center gap-2"
         >
           <Printer size={20} />
           {t.printReport}
@@ -1212,16 +1464,109 @@ function CompanyReport({ company, onMarkPaid, lang }: { company: Company, onMark
     </div>
   );
 }
-function ReportsPage({ startDate, endDate, setStartDate, setEndDate, companies, lang }: { 
+function PatientFile({ patient, services, onAddVisit, lang }: { patient: Patient, services: Service[], onAddVisit: () => void, lang: 'ar' | 'en' }) {
+  const t = translations[lang];
+  const [visits, setVisits] = useState<Visit[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const fetchPatientVisits = async () => {
+    try {
+      const res = await fetch(`/api/visits?patient_id=${patient.id}`);
+      setVisits(await res.json());
+    } catch (error) {
+      console.error("Error fetching patient visits:", error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchPatientVisits();
+  }, [patient.id]);
+
+  if (loading) return <div className="p-8 text-center text-slate-500">{lang === 'ar' ? 'جاري تحميل الملف...' : 'Loading file...'}</div>;
+
+  return (
+    <div className="space-y-6">
+      <div className="bg-slate-50 p-6 rounded-2xl border border-slate-100 flex justify-between items-center">
+        <div>
+          <h4 className="font-bold text-slate-800 text-lg">{patient.name}</h4>
+          <p className="text-sm text-slate-500">{patient.company_name || t.direct}</p>
+        </div>
+        <button 
+          onClick={onAddVisit}
+          className="bg-emerald-600 text-white font-bold px-4 py-2 rounded-xl hover:bg-emerald-700 transition-colors flex items-center gap-2 text-sm"
+        >
+          <Plus size={18} />
+          {t.newVisit}
+        </button>
+      </div>
+
+      <div className="space-y-3">
+        <h5 className="font-bold text-slate-700 flex items-center gap-2">
+          <History size={18} className="text-emerald-600" />
+          {lang === 'ar' ? 'سجل الزيارات' : 'Visit History'} ({visits.length})
+        </h5>
+        
+        <div className="max-h-80 overflow-y-auto custom-scrollbar border border-slate-100 rounded-2xl">
+          <table className={`w-full ${lang === 'ar' ? 'text-right' : 'text-left'} text-sm`}>
+            <thead className="bg-slate-50 sticky top-0">
+              <tr>
+                <th className="px-4 py-3 font-bold text-slate-600">{t.service}</th>
+                <th className="px-4 py-3 font-bold text-slate-600">{t.sessions}</th>
+                <th className="px-4 py-3 font-bold text-slate-600">{t.date}</th>
+                <th className="px-4 py-3 font-bold text-slate-600">{t.amount}</th>
+                <th className="px-4 py-3 font-bold text-slate-600">{t.status}</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-50">
+              {visits.map(visit => (
+                <tr key={visit.id} className="hover:bg-slate-50/50">
+                  <td className="px-4 py-3 font-medium">{visit.service_name}</td>
+                  <td className="px-4 py-3">
+                    {visit.total_sessions && visit.total_sessions > 1 ? (
+                      <span className="text-[10px] font-bold text-emerald-600">
+                        {visit.used_sessions || 0} / {visit.total_sessions}
+                      </span>
+                    ) : (
+                      <span className="text-slate-400">-</span>
+                    )}
+                  </td>
+                  <td className="px-4 py-3 text-slate-500">{new Date(visit.visit_date).toLocaleDateString(lang === 'ar' ? 'ar-SA' : 'en-US')}</td>
+                  <td className="px-4 py-3 font-bold text-slate-700">{visit.amount} {t.sar}</td>
+                  <td className="px-4 py-3">
+                    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                      visit.is_paid ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'
+                    }`}>
+                      {visit.is_paid ? t.paid : t.pending}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+              {visits.length === 0 && (
+                <tr>
+                  <td colSpan={4} className="px-4 py-8 text-center text-slate-400 italic">{t.noData}</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ReportsPage({ startDate, endDate, setStartDate, setEndDate, companies, services, lang }: { 
   startDate: string, 
   endDate: string, 
   setStartDate: (v: string) => void, 
   setEndDate: (v: string) => void,
   companies: Company[],
+  services: Service[],
   lang: 'ar' | 'en'
 }) {
   const t = translations[lang];
-  const [stats, setStats] = useState<any[]>([]);
+  const [companyStats, setCompanyStats] = useState<any[]>([]);
   const [visits, setVisits] = useState<Visit[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedCompany, setSelectedCompany] = useState<string>('all');
@@ -1235,7 +1580,7 @@ function ReportsPage({ startDate, endDate, setStartDate, setEndDate, companies, 
         url += `&company_id=${selectedCompany}`;
       }
       const res = await fetch(url);
-      setStats(await res.json());
+      setCompanyStats(await res.json());
 
       // Also fetch detailed visits for the detailed view
       let visitsUrl = `/api/visits?start_date=${startDate}&end_date=${endDate}`;
@@ -1256,7 +1601,7 @@ function ReportsPage({ startDate, endDate, setStartDate, setEndDate, companies, 
   }, [startDate, endDate, selectedCompany]);
 
   const exportToExcel = () => {
-    const data = viewType === 'summary' ? stats.map(s => ({
+    const data = viewType === 'summary' ? companyStats.map(s => ({
       [t.company]: s.company_name,
       [t.totalPatients]: s.patient_count,
       [t.totalVisits]: s.visit_count,
@@ -1276,9 +1621,9 @@ function ReportsPage({ startDate, endDate, setStartDate, setEndDate, companies, 
     XLSX.writeFile(wb, `${t.reports}_${selectedCompany === 'all' ? t.allCompanies : t.company}_${startDate}_${t.toDate}_${endDate}.xlsx`);
   };
 
-  const totalAmount = stats.reduce((sum, s) => sum + (s.total_amount || 0), 0);
-  const totalVisits = stats.reduce((sum, s) => sum + (s.visit_count || 0), 0);
-  const totalPatients = stats.reduce((sum, s) => sum + (s.patient_count || 0), 0);
+  const totalAmount = companyStats.reduce((sum, s) => sum + (s.total_amount || 0), 0);
+  const totalVisits = companyStats.reduce((sum, s) => sum + (s.visit_count || 0), 0);
+  const totalPatients = companyStats.reduce((sum, s) => sum + (s.patient_count || 0), 0);
 
   return (
     <div className="space-y-8">
@@ -1364,6 +1709,7 @@ function ReportsPage({ startDate, endDate, setStartDate, setEndDate, companies, 
                   <th className="px-6 py-4 font-semibold">{t.patient}</th>
                   <th className="px-6 py-4 font-semibold">{t.service}</th>
                   <th className="px-6 py-4 font-semibold">{t.company}</th>
+                  <th className="px-6 py-4 font-semibold">{t.sessions}</th>
                   <th className="px-6 py-4 font-semibold">{t.date}</th>
                   <th className="px-6 py-4 font-semibold">{t.amount}</th>
                   <th className="px-6 py-4 font-semibold">{t.status}</th>
@@ -1375,6 +1721,24 @@ function ReportsPage({ startDate, endDate, setStartDate, setEndDate, companies, 
                     <td className="px-6 py-4 font-bold text-slate-700">{v.patient_name}</td>
                     <td className="px-6 py-4 text-emerald-600">{v.service_name}</td>
                     <td className="px-6 py-4 text-slate-600">{v.company_name || t.direct}</td>
+                    <td className="px-6 py-4">
+                      {v.total_sessions && v.total_sessions > 1 ? (
+                        <div className="flex flex-col gap-1">
+                          <div className="flex justify-between text-[10px] font-bold">
+                            <span className="text-emerald-600">{v.used_sessions || 0}</span>
+                            <span className="text-slate-400">/ {v.total_sessions}</span>
+                          </div>
+                          <div className="w-16 bg-slate-100 h-1.5 rounded-full overflow-hidden">
+                            <div 
+                              className="bg-emerald-500 h-full transition-all"
+                              style={{ width: `${((v.used_sessions || 0) / v.total_sessions) * 100}%` }}
+                            />
+                          </div>
+                        </div>
+                      ) : (
+                        <span className="text-slate-400">-</span>
+                      )}
+                    </td>
                     <td className="px-6 py-4 text-slate-500">{new Date(v.visit_date).toLocaleDateString(lang === 'ar' ? 'ar-SA' : 'en-US')}</td>
                     <td className="px-6 py-4 font-bold text-slate-700">{v.amount?.toLocaleString() || 0} {t.sar}</td>
                     <td className="px-6 py-4">
@@ -1406,7 +1770,7 @@ function ReportsPage({ startDate, endDate, setStartDate, setEndDate, companies, 
             </h4>
             <div className="space-y-6">
               {selectedCompany === 'all' ? (
-                stats.slice(0, 5).map((s, i) => (
+                companyStats.slice(0, 5).map((s, i) => (
                   <div key={i} className="space-y-2">
                     <div className="flex justify-between text-sm">
                       <span className="font-bold text-slate-600">{s.company_name}</span>
@@ -1432,20 +1796,34 @@ function ReportsPage({ startDate, endDate, setStartDate, setEndDate, companies, 
               )}
             </div>
           </div>
-          <div className="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm flex flex-col items-center justify-center text-center space-y-4">
-            <div className="w-20 h-20 bg-emerald-50 rounded-full flex items-center justify-center">
-              <TrendingUp size={40} className="text-emerald-600" />
+
+          <div className="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm">
+            <h4 className="font-bold text-slate-700 mb-6 flex items-center gap-2">
+              <TrendingUp className="text-blue-500" size={20} />
+              {t.revenueByService}
+            </h4>
+            <div className="space-y-6">
+              {services.map((service) => {
+                const serviceTotal = visits.filter(v => v.service_id === service.id).reduce((sum, v) => sum + v.amount, 0);
+                const percentage = (serviceTotal / (totalAmount || 1)) * 100;
+                if (serviceTotal === 0) return null;
+                return (
+                  <div key={service.id} className="space-y-2">
+                    <div className="flex justify-between text-sm">
+                      <span className="font-bold text-slate-600">{service.name}</span>
+                      <span className="text-slate-400">{percentage.toFixed(1)}%</span>
+                    </div>
+                    <div className="w-full bg-slate-100 h-3 rounded-full overflow-hidden">
+                      <motion.div 
+                        initial={{ width: 0 }}
+                        animate={{ width: `${percentage}%` }}
+                        className="bg-blue-500 h-full"
+                      />
+                    </div>
+                  </div>
+                );
+              })}
             </div>
-            <div>
-              <h4 className="font-bold text-xl text-slate-800">{t.performanceReport}</h4>
-              <p className="text-slate-500 text-sm max-w-xs">{t.growthMessage}</p>
-            </div>
-            <button 
-              onClick={() => setViewType('detailed')}
-              className="text-emerald-600 font-bold hover:underline"
-            >
-              {t.viewFullDetails}
-            </button>
           </div>
         </div>
       )}
@@ -1550,13 +1928,21 @@ function AddVisitForm({ patients, services, onSuccess, initialData, lang }: { pa
   const [serviceId, setServiceId] = useState(initialData?.service_id?.toString() || '');
   const [date, setDate] = useState(initialData?.visit_date || new Date().toISOString().split('T')[0]);
   const [amount, setAmount] = useState(initialData?.amount?.toString() || '');
+  const [paidAmount, setPaidAmount] = useState(initialData?.paid_amount?.toString() || '0');
+  const [totalSessions, setTotalSessions] = useState(initialData?.total_sessions?.toString() || '1');
   const [notes, setNotes] = useState(initialData?.notes || '');
   const [isPaid, setIsPaid] = useState(initialData?.is_paid === 1);
+
+  const selectedPatient = patients.find(p => p.id.toString() === patientId);
+  const isCompanyPatient = !!selectedPatient?.company_id;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const url = initialData ? `/api/visits/${initialData.id}` : '/api/visits';
     const method = initialData ? 'PUT' : 'POST';
+
+    const finalPaidAmount = isCompanyPatient ? 0 : parseFloat(paidAmount);
+    const finalIsPaid = isCompanyPatient ? 0 : (isPaid || finalPaidAmount >= parseFloat(amount) ? 1 : 0);
 
     await fetch(url, {
       method,
@@ -1566,8 +1952,10 @@ function AddVisitForm({ patients, services, onSuccess, initialData, lang }: { pa
         service_id: serviceId,
         visit_date: date, 
         amount: parseFloat(amount), 
+        paid_amount: finalPaidAmount,
+        total_sessions: parseInt(totalSessions) || 1,
         notes,
-        is_paid: isPaid
+        is_paid: finalIsPaid
       })
     });
     onSuccess();
@@ -1586,6 +1974,12 @@ function AddVisitForm({ patients, services, onSuccess, initialData, lang }: { pa
           <option value="">{lang === 'ar' ? 'اختر المريض' : 'Select Patient'}</option>
           {patients.map(p => <option key={p.id} value={p.id}>{p.name} ({p.company_name || t.direct})</option>)}
         </select>
+        {isCompanyPatient && (
+          <p className="mt-1 text-[10px] text-amber-600 font-bold flex items-center gap-1">
+            <Building2 size={12} />
+            {lang === 'ar' ? 'هذا المريض تابع لشركة، سيتم تسجيل الدفع من حساب الشركة لاحقاً' : 'This patient belongs to a company, payment will be recorded from the company account later'}
+          </p>
+        )}
       </div>
       <div>
         <label className="block text-sm font-bold text-slate-700 mb-1">{t.service}</label>
@@ -1609,16 +2003,50 @@ function AddVisitForm({ patients, services, onSuccess, initialData, lang }: { pa
           className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 outline-none"
         />
       </div>
-      <div>
-        <label className="block text-sm font-bold text-slate-700 mb-1">{t.amount} ({t.sar})</label>
-        <input 
-          type="number"
-          required
-          value={amount}
-          onChange={(e) => setAmount(e.target.value)}
-          className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 outline-none"
-          placeholder="0.00"
-        />
+      {!initialData && (
+        <div>
+          <label className="block text-sm font-bold text-slate-700 mb-1">{t.totalSessions}</label>
+          <input 
+            type="number"
+            min="1"
+            required
+            value={totalSessions}
+            onChange={(e) => setTotalSessions(e.target.value)}
+            placeholder="1"
+            className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 outline-none"
+          />
+          {parseInt(totalSessions) > 1 && (
+            <p className="mt-1 text-[10px] text-blue-600 font-bold flex items-center gap-1">
+              <Clock size={12} />
+              {lang === 'ar' ? 'سيتم إنشاء برنامج علاجي تلقائياً لهذا المريض' : 'A treatment package will be created automatically for this patient'}
+            </p>
+          )}
+        </div>
+      )}
+      <div className={`grid ${isCompanyPatient ? 'grid-cols-1' : 'grid-cols-2'} gap-4`}>
+        <div>
+          <label className="block text-sm font-bold text-slate-700 mb-1">{t.amount} ({t.sar})</label>
+          <input 
+            type="number"
+            required
+            value={amount}
+            onChange={(e) => setAmount(e.target.value)}
+            className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 outline-none"
+            placeholder="0.00"
+          />
+        </div>
+        {!isCompanyPatient && (
+          <div>
+            <label className="block text-sm font-bold text-slate-700 mb-1">{t.amountPaid} ({t.sar})</label>
+            <input 
+              type="number"
+              value={paidAmount}
+              onChange={(e) => setPaidAmount(e.target.value)}
+              className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 outline-none"
+              placeholder="0.00"
+            />
+          </div>
+        )}
       </div>
       <div>
         <label className="block text-sm font-bold text-slate-700 mb-1">{t.notes}</label>
@@ -1629,7 +2057,7 @@ function AddVisitForm({ patients, services, onSuccess, initialData, lang }: { pa
           placeholder={lang === 'ar' ? "أي ملاحظات إضافية عن الجلسة..." : "Any additional notes about the session..."}
         />
       </div>
-      {initialData && (
+      {initialData && !isCompanyPatient && (
         <div className="flex items-center gap-2">
           <input type="checkbox" id="isPaid" checked={isPaid} onChange={(e) => setIsPaid(e.target.checked)} className="w-4 h-4 text-emerald-600" />
           <label htmlFor="isPaid" className="text-sm font-bold text-slate-700">{t.paid}</label>
